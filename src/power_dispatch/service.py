@@ -28,13 +28,28 @@ from .planning import (
     weighted_inventory_cost,
 )
 from .storage import initialize, transaction
+from .dr_service import DemandResponseService
 
 
 ROLE_PERMISSIONS = {
     "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
-    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
-    "risk": {"outage.write", "scenario.approve", "report.read"},
-    "auditor": {"report.read", "audit.read"},
+    "dispatcher": {
+        "nomination.write", "allocation.run", "transfer.write", "inventory.write",
+        "dr.meter.import", "dr.event.execute",
+    },
+    "risk": {
+        "outage.write", "scenario.approve", "report.read",
+        "dr.event.review", "dr.correction.review",
+    },
+    "auditor": {"report.read", "audit.read", "dr.report.read"},
+    "marketer": {
+        "dr.site.write", "dr.meter.import", "dr.event.write", "dr.event.confirm",
+        "report.read", "dr.report.read",
+    },
+    "biller": {
+        "dr.settlement.write", "dr.bill.publish", "dr.correction.propose",
+        "report.read", "dr.report.read",
+    },
 }
 
 
@@ -43,6 +58,7 @@ class SupplyService:
         self.connection = connection
         self.clock = clock or SystemClock()
         initialize(connection)
+        self.dr = DemandResponseService(self)
 
     def _now(self) -> str:
         return utc_text(self.clock.now())

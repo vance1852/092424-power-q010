@@ -14,7 +14,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS supply_users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor')),
+    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor','marketer','biller')),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_at TEXT NOT NULL
 );
@@ -194,11 +194,147 @@ CREATE TABLE IF NOT EXISTS supply_audit_events (
 
 CREATE INDEX IF NOT EXISTS idx_supply_audit_entity
 ON supply_audit_events(entity_type, entity_id, event_id);
+
+CREATE TABLE IF NOT EXISTS dr_sites (
+    site_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    timezone TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS dr_meter_series (
+    series_id TEXT NOT NULL,
+    site_id TEXT NOT NULL REFERENCES dr_sites(site_id),
+    metric TEXT NOT NULL CHECK(metric IN ('load_kw','baseline_load_kw')),
+    source_revision TEXT NOT NULL,
+    interval_minutes INTEGER NOT NULL CHECK(interval_minutes > 0 AND interval_minutes <= 1440),
+    content_sha256 TEXT NOT NULL,
+    imported_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    imported_at TEXT NOT NULL,
+    PRIMARY KEY(series_id, source_revision)
+);
+
+CREATE TABLE IF NOT EXISTS dr_meter_readings (
+    series_id TEXT NOT NULL,
+    source_revision TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    value_kw TEXT,
+    quality TEXT NOT NULL CHECK(quality IN ('ok','missing','outage')),
+    PRIMARY KEY(series_id, source_revision, ts),
+    FOREIGN KEY(series_id, source_revision)
+        REFERENCES dr_meter_series(series_id, source_revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dr_readings_ts
+ON dr_meter_readings(series_id, source_revision, ts);
+
+CREATE TABLE IF NOT EXISTS dr_events (
+    event_id TEXT PRIMARY KEY,
+    site_id TEXT NOT NULL REFERENCES dr_sites(site_id),
+    program_id TEXT NOT NULL,
+    customer_id TEXT NOT NULL,
+    window_start TEXT NOT NULL,
+    window_end TEXT NOT NULL,
+    interval_minutes INTEGER NOT NULL,
+    target_kwh TEXT NOT NULL,
+    partial_rate TEXT NOT NULL,
+    full_rate TEXT NOT NULL,
+    over_rate TEXT NOT NULL,
+    baseline_days INTEGER NOT NULL,
+    min_coverage TEXT NOT NULL,
+    excluded_dates_json TEXT NOT NULL,
+    definition_json TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'draft' CHECK(state IN (
+        'draft','confirmed','executed','review_rejected','reviewed','settled','published','cancelled'
+    )),
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    confirmed_by TEXT REFERENCES supply_users(user_id),
+    confirmed_at TEXT,
+    executed_by TEXT REFERENCES supply_users(user_id),
+    executed_at TEXT,
+    reviewed_by TEXT REFERENCES supply_users(user_id),
+    reviewed_at TEXT,
+    review_note TEXT,
+    current_execution_id INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_dr_events_customer
+ON dr_events(customer_id, state);
+
+CREATE TABLE IF NOT EXISTS dr_event_executions (
+    execution_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL REFERENCES dr_events(event_id),
+    baseline_series_id TEXT NOT NULL,
+    baseline_revision TEXT NOT NULL,
+    actual_series_id TEXT NOT NULL,
+    actual_revision TEXT NOT NULL,
+    input_sha256 TEXT NOT NULL,
+    evidence_sha256 TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    correction_id INTEGER,
+    executed_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    executed_at TEXT NOT NULL,
+    UNIQUE(event_id, input_sha256),
+    FOREIGN KEY(baseline_series_id, baseline_revision)
+        REFERENCES dr_meter_series(series_id, source_revision),
+    FOREIGN KEY(actual_series_id, actual_revision)
+        REFERENCES dr_meter_series(series_id, source_revision)
+);
+
+CREATE TABLE IF NOT EXISTS dr_settlements (
+    settlement_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL UNIQUE REFERENCES dr_events(event_id),
+    execution_id INTEGER NOT NULL REFERENCES dr_event_executions(execution_id),
+    reduction_kwh TEXT NOT NULL,
+    response_class TEXT NOT NULL,
+    energy_amount_cny TEXT NOT NULL,
+    carry_in_adjustments_json TEXT NOT NULL DEFAULT '[]',
+    carry_in_cny TEXT NOT NULL DEFAULT '0.00',
+    total_amount_cny TEXT NOT NULL,
+    evidence_sha256 TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'draft' CHECK(state IN ('draft','published')),
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    published_by TEXT REFERENCES supply_users(user_id),
+    published_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS dr_corrections (
+    correction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    settlement_id TEXT NOT NULL REFERENCES dr_settlements(settlement_id),
+    event_id TEXT NOT NULL REFERENCES dr_events(event_id),
+    customer_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('measurement','baseline','rate','metadata')),
+    reason TEXT NOT NULL,
+    note TEXT NOT NULL,
+    prior_evidence_sha256 TEXT NOT NULL,
+    new_execution_id INTEGER REFERENCES dr_event_executions(execution_id),
+    amount_delta_cny TEXT,
+    status TEXT NOT NULL DEFAULT 'proposed'
+        CHECK(status IN ('proposed','approved','rejected')),
+    proposed_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    proposed_at TEXT NOT NULL,
+    reviewed_by TEXT REFERENCES supply_users(user_id),
+    reviewed_at TEXT,
+    review_note TEXT,
+    applied_settlement_id TEXT REFERENCES dr_settlements(settlement_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dr_corrections_customer
+ON dr_corrections(customer_id, status);
 """
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    # ThreadingHTTPServer 会在工作线程中复用同一连接；所有写操作都走
+    # BEGIN IMMEDIATE 短事务，配合 WAL 与 busy_timeout 可以跨线程使用。
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")

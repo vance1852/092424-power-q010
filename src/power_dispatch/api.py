@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,6 +25,9 @@ class Response:
 class JsonApplication:
     def __init__(self, service: SupplyService) -> None:
         self.service = service
+        # ThreadingHTTPServer 的工作线程共享一个 SQLite 连接，
+        # 用可重入锁把请求串行化，避免事务在连接上交错。
+        self.lock = threading.RLock()
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -45,6 +49,10 @@ class JsonApplication:
         return value
 
     def handle(self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b"") -> Response:
+        with self.lock:
+            return self._handle(method, target, headers, body)
+
+    def _handle(self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b"") -> Response:
         normalized = {key.lower(): value for key, value in (headers or {}).items()}
         parsed = urlparse(target)
         path = parsed.path.rstrip("/") or "/"
@@ -85,6 +93,71 @@ class JsonApplication:
                 return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
+            if method == "POST" and path == "/dr/sites":
+                return Response(201, self.service.dr.register_site(actor, payload))
+            if method == "POST" and path == "/dr/meter-series":
+                return Response(201, self.service.dr.import_meter_series(actor, payload))
+            if method == "POST" and path == "/dr/events":
+                return Response(201, self.service.dr.create_event(actor, payload))
+            if (
+                method in {"GET", "POST"}
+                and len(parts) >= 3
+                and parts[0] == "dr"
+                and parts[1] == "events"
+            ):
+                event_id = parts[2]
+                action = parts[3] if len(parts) == 4 else ""
+                if method == "GET" and action == "":
+                    return Response(200, self.service.dr.event(event_id))
+                if method == "POST" and action == "confirm":
+                    return Response(200, self.service.dr.confirm_event(actor, event_id, int(payload["expected_revision"])))
+                if method == "POST" and action == "cancel":
+                    return Response(200, self.service.dr.cancel_event(actor, event_id, int(payload["expected_revision"]), payload["reason"]))
+                if method == "POST" and action == "execute":
+                    return Response(200, self.service.dr.execute_event(
+                        actor, event_id,
+                        payload["baseline_series_id"], payload["baseline_source_revision"],
+                        payload["actual_series_id"], payload["actual_source_revision"],
+                        int(payload["expected_revision"]),
+                    ))
+                if method == "POST" and action == "review":
+                    return Response(200, self.service.dr.review_event(
+                        actor, event_id, bool(payload["approved"]), payload["note"],
+                        int(payload["expected_revision"]),
+                    ))
+                if method == "POST" and action == "settle":
+                    return Response(201, self.service.dr.settle_event(actor, event_id))
+            if (
+                method in {"GET", "POST"}
+                and len(parts) >= 3
+                and parts[0] == "dr"
+                and parts[1] == "settlements"
+            ):
+                settlement_id = parts[2]
+                action = parts[3] if len(parts) == 4 else ""
+                if method == "GET" and action == "":
+                    return Response(200, self.service.dr.settlement(settlement_id))
+                if method == "POST" and action == "publish":
+                    return Response(200, self.service.dr.publish_bill(actor, settlement_id))
+                if method == "POST" and action == "corrections":
+                    return Response(201, self.service.dr.propose_correction(
+                        actor, settlement_id,
+                        kind=payload["kind"], reason=payload["reason"], note=payload["note"],
+                        replacement_series_id=payload["replacement_series_id"],
+                        replacement_revision=payload["replacement_source_revision"],
+                    ))
+            if method == "GET" and len(parts) == 3 and parts[:2] == ["dr", "corrections"]:
+                return Response(200, self.service.dr.correction(int(parts[2])))
+            if (
+                method == "POST"
+                and len(parts) == 4
+                and parts[0] == "dr"
+                and parts[1] == "corrections"
+                and parts[3] == "review"
+            ):
+                return Response(200, self.service.dr.review_correction(
+                    actor, int(parts[2]), bool(payload["approved"]), payload["note"],
+                ))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except SupplyError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})

@@ -6,9 +6,9 @@ import re
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
-from .clock import parse_utc
+from .clock import parse_utc, utc_text
 from .errors import ValidationFailed
 
 
@@ -259,4 +259,141 @@ class SupplyScenario:
             ),
             route_capacity_changes=parsed_routes,
             demand_changes=parsed_demand,
+        )
+
+
+DR_READING_QUALITIES = {"ok", "missing", "outage"}
+
+
+def _aware(value: str, field: str):
+    try:
+        return parse_utc(value, field)
+    except ValueError as exc:
+        raise ValidationFailed(str(exc)) from exc
+
+
+@dataclass(frozen=True, slots=True)
+class MeterSeries:
+    """同一物理量的一版冻结测量数据（基线历史负荷或窗口实测负荷）。"""
+
+    series_id: str
+    site_id: str
+    metric: str
+    source_revision: str
+    interval_minutes: int
+    readings: Sequence[Mapping[str, Any]]
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "MeterSeries":
+        metric = required_text(raw.get("metric"), "metric", 24)
+        if metric not in {"load_kw", "baseline_load_kw"}:
+            raise ValidationFailed("metric 必须是 load_kw 或 baseline_load_kw")
+        interval = raw.get("interval_minutes")
+        if isinstance(interval, bool) or not isinstance(interval, int) or not 1 <= interval <= 1440 or 1440 % interval != 0:
+            raise ValidationFailed("interval_minutes 必须是整除 1440 的正整数")
+        readings = raw.get("readings", [])
+        if not isinstance(readings, list) or not readings:
+            raise ValidationFailed("readings 必须是非空数组")
+        parsed: list[Mapping[str, Any]] = []
+        seen: set[str] = set()
+        for item in readings:
+            if not isinstance(item, Mapping):
+                raise ValidationFailed("readings 每项必须是对象")
+            ts = required_text(item.get("ts"), "readings[].ts", 40)
+            parsed_ts = _aware(ts, "readings[].ts")
+            quality = required_text(item.get("quality"), "readings[].quality", 16)
+            if quality not in DR_READING_QUALITIES:
+                raise ValidationFailed("readings[].quality 必须是 ok、missing 或 outage")
+            value = item.get("value_kw")
+            if quality == "ok":
+                value = decimal_value(value, "readings[].value_kw", minimum=Decimal("0"))
+            elif value is not None:
+                raise ValidationFailed("missing/outage 测点不能携带 value_kw")
+            key = parsed_ts.isoformat()
+            if key in seen:
+                raise ValidationFailed("同一时刻测点重复")
+            seen.add(key)
+            parsed.append({
+                "ts": parsed_ts,
+                "quality": quality,
+                "value_kw": None if value is None else value,
+            })
+        return cls(
+            series_id=identifier(raw.get("series_id"), "series_id"),
+            site_id=identifier(raw.get("site_id"), "site_id"),
+            metric=metric,
+            source_revision=identifier(raw.get("source_revision"), "source_revision"),
+            interval_minutes=interval,
+            readings=parsed,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DemandResponseEvent:
+    event_id: str
+    site_id: str
+    program_id: str
+    customer_id: str
+    window_start: str
+    window_end: str
+    interval_minutes: int
+    target_kwh: Decimal
+    partial_rate: Decimal
+    full_rate: Decimal
+    over_rate: Decimal
+    baseline_days: int
+    min_coverage: Decimal
+    excluded_dates: Sequence[str]
+    note: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "DemandResponseEvent":
+        window_start = _aware(required_text(raw.get("window_start"), "window_start", 40), "window_start")
+        window_end = _aware(required_text(raw.get("window_end"), "window_end", 40), "window_end")
+        if window_end <= window_start:
+            raise ValidationFailed("window_end 必须晚于 window_start")
+        interval = raw.get("interval_minutes")
+        if isinstance(interval, bool) or not isinstance(interval, int) or not 1 <= interval <= 1440 or 1440 % interval != 0:
+            raise ValidationFailed("interval_minutes 必须是整除 1440 的正整数")
+        if (window_end - window_start).total_seconds() % (interval * 60) != 0:
+            raise ValidationFailed("响应窗口长度必须是 interval_minutes 的整数倍")
+        baseline_days = raw.get("baseline_days", 10)
+        if isinstance(baseline_days, bool) or not isinstance(baseline_days, int) or not 1 <= baseline_days <= 60:
+            raise ValidationFailed("baseline_days 必须是 1 到 60 的正整数")
+        min_coverage = decimal_value(
+            raw.get("min_coverage", "0.8"),
+            "min_coverage",
+            minimum=Decimal("0.5"),
+            maximum=Decimal("1"),
+        )
+        excluded = raw.get("excluded_dates", [])
+        if not isinstance(excluded, list) or len(excluded) > 60:
+            raise ValidationFailed("excluded_dates 必须是最多 60 项的数组")
+        excluded_dates = [date_text(item, "excluded_dates[]") for item in excluded]
+        if len(set(excluded_dates)) != len(excluded_dates):
+            raise ValidationFailed("excluded_dates 不能重复")
+        full_rate = decimal_value(raw.get("full_rate_cny_per_kwh"), "full_rate_cny_per_kwh", minimum=Decimal("0"))
+        over_rate = decimal_value(
+            raw.get("over_rate_cny_per_kwh", raw.get("full_rate_cny_per_kwh")),
+            "over_rate_cny_per_kwh",
+            minimum=Decimal("0"),
+        )
+        if over_rate > full_rate:
+            raise ValidationFailed("over_rate_cny_per_kwh 不能高于 full_rate_cny_per_kwh")
+        return cls(
+            event_id=identifier(raw.get("event_id"), "event_id"),
+            site_id=identifier(raw.get("site_id"), "site_id"),
+            program_id=identifier(raw.get("program_id"), "program_id"),
+            customer_id=identifier(raw.get("customer_id"), "customer_id"),
+            window_start=utc_text(window_start),
+            window_end=utc_text(window_end),
+            interval_minutes=interval,
+            target_kwh=decimal_value(raw.get("target_kwh"), "target_kwh", minimum=Decimal("0.001")),
+            partial_rate=decimal_value(raw.get("partial_rate_cny_per_kwh"), "partial_rate_cny_per_kwh", minimum=Decimal("0")),
+            full_rate=full_rate,
+            over_rate=over_rate,
+            baseline_days=baseline_days,
+            min_coverage=min_coverage,
+            excluded_dates=excluded_dates,
+            note=required_text(raw.get("note", "-"), "note", 512),
         )
