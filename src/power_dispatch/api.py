@@ -11,6 +11,7 @@ from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
 
 from .errors import SupplyError, ValidationFailed
+from .dr_service import DemandResponseService
 from .service import SupplyService
 from .storage import connect
 
@@ -22,8 +23,9 @@ class Response:
 
 
 class JsonApplication:
-    def __init__(self, service: SupplyService) -> None:
+    def __init__(self, service: SupplyService, dr: DemandResponseService | None = None) -> None:
         self.service = service
+        self.dr = dr or DemandResponseService(service.connection)
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -85,6 +87,40 @@ class JsonApplication:
                 return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
+            # 需求响应
+            if method == "POST" and path == "/dr/meter-series":
+                return Response(201, self.dr.record_meter_series(actor, payload))
+            if method == "GET" and len(parts) == 3 and parts[:2] == ["dr", "meter-series"]:
+                return Response(200, self.dr.series_detail(actor, int(parts[2])))
+            if method == "POST" and path == "/dr/events":
+                return Response(201, self.dr.create_event(actor, payload))
+            if method == "GET" and len(parts) == 3 and parts[:2] == ["dr", "events"]:
+                return Response(200, self.dr.event_detail(actor, parts[2]))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["dr", "events"] and parts[3] == "confirm":
+                return Response(200, self.dr.confirm_event(actor, parts[2]))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["dr", "events"] and parts[3] == "cancel":
+                return Response(200, self.dr.cancel_event(actor, parts[2], str(payload.get("reason", ""))))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["dr", "events"] and parts[3] == "baseline":
+                return Response(200, self.dr.prepare_baseline(actor, parts[2], payload))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["dr", "events"] and parts[3] == "measurements":
+                return Response(201, self.dr.submit_measurement(actor, parts[2], payload.get("series", payload), str(payload.get("idempotency_key", ""))))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["dr", "events"] and parts[3] == "reviews":
+                return Response(201, self.dr.review_event(actor, parts[2], int(payload["measurement_id"]), payload["decision"], payload["note"]))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["dr", "events"] and parts[3] == "settlement":
+                return Response(201, self.dr.create_settlement(actor, parts[2]))
+            if method == "POST" and len(parts) == 5 and parts[:2] == ["dr", "events"] and parts[3:] == ["settlement", "publish"]:
+                return Response(200, self.dr.publish_settlement(actor, parts[2]))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["dr", "events"] and parts[3] == "corrections":
+                return Response(201, self.dr.request_correction(actor, parts[2], payload))
+            if method == "GET" and len(parts) == 4 and parts[:2] == ["dr", "events"] and parts[3] == "audit-trail":
+                return Response(200, self.dr.event_audit_trail(actor, parts[2]))
+            if method == "GET" and path == "/dr/corrections":
+                state = query.get("state", [None])[0]
+                return Response(200, self.dr.list_corrections(actor, state))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["dr", "corrections"] and parts[3] == "apply":
+                return Response(200, self.dr.apply_correction(actor, int(parts[2]), payload["decision"], payload["note"]))
+            if method == "GET" and path == "/dr/audit/chain":
+                return Response(200, self.dr.chain_status(actor))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except SupplyError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
